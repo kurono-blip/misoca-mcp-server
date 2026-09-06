@@ -1,66 +1,201 @@
-import { McpServer } from "@modelcontextprotocol/server";
-import { createMcpHandler } from "agents/mcp/server";
+import OAuthProvider from "@cloudflare/workers-oauth-provider";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpAgent } from "agents/mcp";
 import { z } from "zod";
 
-function createServer() {
-	const server = new McpServer({
-		name: "Authless Calculator",
-		version: "1.0.0",
-	});
+import {
+  MisocaHandler,
+  type MisocaProps,
+  refreshMisocaToken,
+} from "./misoca-auth";
 
-	server.registerTool(
-		"add",
-		{ inputSchema: z.object({ a: z.number(), b: z.number() }) },
-		async ({ a, b }) => ({
-			content: [{ type: "text", text: String(a + b) }],
-		}),
-	);
+const MISOCA_API_BASE = "https://app.misoca.jp/api/v3";
 
-	server.registerTool(
-		"calculate",
-		{
-			inputSchema: z.object({
-				operation: z.enum(["add", "subtract", "multiply", "divide"]),
-				a: z.number(),
-				b: z.number(),
-			}),
-		},
-		async ({ operation, a, b }) => {
-			let result: number;
-			switch (operation) {
-				case "add":
-					result = a + b;
-					break;
-				case "subtract":
-					result = a - b;
-					break;
-				case "multiply":
-					result = a * b;
-					break;
-				case "divide":
-					if (b === 0)
-						return {
-							content: [
-								{
-									type: "text",
-									text: "Error: Cannot divide by zero",
-								},
-							],
-						};
-					result = a / b;
-					break;
-			}
-			return { content: [{ type: "text", text: String(result) }] };
-		},
-	);
+type McpEnv = Env & {
+  MISOCA_CLIENT_ID: string;
+  MISOCA_CLIENT_SECRET: string;
+};
 
-	return server;
+export class MyMCP extends McpAgent<
+  McpEnv,
+  Record<string, never>,
+  MisocaProps
+> {
+  server = new McpServer({
+    name: "Misoca MCP Server",
+    version: "1.0.0",
+  });
+
+  private async getAccessToken(): Promise<string> {
+    const now = Date.now();
+
+    if (
+      this.props.accessToken &&
+      (!this.props.expiresAt ||
+        now < this.props.expiresAt - 60_000)
+    ) {
+      return this.props.accessToken;
+    }
+
+    if (!this.props.refreshToken) {
+      throw new Error(
+        "Misoca access token expired and no refresh token is available. Reconnect Misoca.",
+      );
+    }
+
+    const refreshed = await refreshMisocaToken(
+      this.env,
+      this.props.refreshToken,
+    );
+
+    if (!refreshed.access_token) {
+      throw new Error(
+        "Misoca token refresh did not return an access token.",
+      );
+    }
+
+    /*
+     * Use the refreshed token for this MCP object instance.
+     * If Misoca rotates the refresh token, keep the new one too.
+     */
+    this.props.accessToken = refreshed.access_token;
+
+    if (refreshed.refresh_token) {
+      this.props.refreshToken = refreshed.refresh_token;
+    }
+
+    if (refreshed.expires_in) {
+      this.props.expiresAt =
+        Date.now() + refreshed.expires_in * 1000;
+    }
+
+    return this.props.accessToken;
+  }
+
+  private async misocaGet(
+    path: string,
+  ): Promise<unknown> {
+    const accessToken = await this.getAccessToken();
+
+    const response = await fetch(
+      `${MISOCA_API_BASE}${path}`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: "application/json",
+        },
+      },
+    );
+
+    if (!response.ok) {
+      const body = await response.text();
+
+      throw new Error(
+        `Misoca API error (${response.status}): ${body}`,
+      );
+    }
+
+    return await response.json();
+  }
+
+  async init() {
+    this.server.tool(
+      "list_invoices",
+      "Misocaの請求書一覧を取得します。",
+      {
+        page: z.number().int().positive().optional(),
+      },
+      async ({ page }) => {
+        try {
+          const params = new URLSearchParams();
+
+          if (page !== undefined) {
+            params.set("page", String(page));
+          }
+
+          const query = params.toString();
+
+          const data = await this.misocaGet(
+            `/invoices${query ? `?${query}` : ""}`,
+          );
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(data, null, 2),
+              },
+            ],
+          };
+        } catch (error) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text:
+                  error instanceof Error
+                    ? error.message
+                    : "Failed to get Misoca invoices.",
+              },
+            ],
+          };
+        }
+      },
+    );
+
+    this.server.tool(
+      "get_invoice",
+      "Misocaの請求書IDを指定して詳細を取得します。支払状況など請求書の詳細確認に使用します。",
+      {
+        invoiceId: z.union([
+          z.string().min(1),
+          z.number().int().positive(),
+        ]),
+      },
+      async ({ invoiceId }) => {
+        try {
+          const id = encodeURIComponent(
+            String(invoiceId),
+          );
+
+          const data = await this.misocaGet(
+            `/invoice/${id}`,
+          );
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(data, null, 2),
+              },
+            ],
+          };
+        } catch (error) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text:
+                  error instanceof Error
+                    ? error.message
+                    : "Failed to get Misoca invoice.",
+              },
+            ],
+          };
+        }
+      },
+    );
+  }
 }
 
-const handler = createMcpHandler(createServer);
-
-export default {
-	fetch(request: Request, env: Env, ctx: ExecutionContext) {
-		return handler(request, env, ctx);
-	},
-} satisfies ExportedHandler<Env>;
+export default new OAuthProvider({
+  apiRoute: "/mcp",
+  apiHandler: MyMCP.serve("/mcp"),
+  defaultHandler: MisocaHandler as any,
+  authorizeEndpoint: "/authorize",
+  tokenEndpoint: "/token",
+  clientRegistrationEndpoint: "/register",
+});
